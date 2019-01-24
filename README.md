@@ -1,115 +1,51 @@
-[![Build Status](https://travis-ci.org/kubernetes-csi/external-attacher.svg?branch=master)](https://travis-ci.org/kubernetes-csi/external-attacher)
+# [csi-release-tools](https://github.com/kubernetes-csi/csi-release-tools)
 
-# CSI attacher
+These build and test rules can be shared between different Go projects
+without modifications. Customization for the different projects happen
+in the top-level Makefile.
 
-The csi-attacher is part of Kubernetes implementation of [Container Storage Interface (CSI)](https://github.com/container-storage-interface/spec).
+The rules include support for building and pushing Docker images, with
+the following features:
+ - one or more command and image per project
+ - push canary and/or tagged release images
+ - automatically derive the image tag(s) from repo tags
+ - the source code revision is stored in a "revision" image label
+ - never overwrites an existing release image
 
-## Overview
+Usage
+-----
 
-In short, it's an external controller that monitors `VolumeAttachment` objects and attaches/detaches volumes to/from nodes. Full design can be found at Kubernetes proposal at [container-storage-interface.md](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/storage/container-storage-interface.md)
-There is no plan to implement a generic external attacher library, csi-attacher is the only external attacher that exists. If this proves false in future, splitting a generic external-attacher library should be possible with some effort.
+The expected repository layout is:
+ - `cmd/*/*.go` - source code for each command
+ - `cmd/*/Dockerfile` - docker file for each command or
+   Dockerfile in the root when only building a single command
+ - `Makefile` - includes `release-tools/build.make` and sets
+   configuration variables
+ - `.travis.yml` - a symlink to `release-tools/.travis.yml`
 
-## Design
+To create a release, tag a certain revision with a name that
+starts with `v`, for example `v1.0.0`, then `make push`
+while that commit is checked out.
 
-External attacher follows [controller](https://github.com/kubernetes/community/blob/master/contributors/devel/controllers.md) pattern and uses informers to watch for `VolumeAttachment` and `PersistentVolume` create/update/delete events. It filters out `VolumeAttachment` instances with `Attacher==<CSI driver name>` and processes these events in workqueues with exponential backoff. Real handling is deferred to `Handler` interface.
+It does not matter on which branch that revision exists, i.e. it is
+possible to create releases directly from master. A release branch can
+still be created for maintenance releases later if needed.
 
-`Handler` interface has two implementations, trivial and real one.
+Release branches are expected to be named `release-x.y` for releases
+`x.y.z`. Building from such a branch creates `x.y-canary`
+images. Building from master creates the main `canary` image.
 
-### Trivial handler
+Sharing and updating
+--------------------
 
-Trivial handler will be used for CSI drivers that don't support `ControllerPublish` calls and marks all `VolumeAttachment` as attached. It does not use any finalizers. This attacher can also be used for testing.
+[`git subtree`](https://github.com/git/git/blob/master/contrib/subtree/git-subtree.txt)
+is the recommended way of maintaining a copy of the rules inside the
+`release-tools` directory of a project. This way, it is possible to make
+changes also locally, test them and then push them back to the shared
+repository at a later time.
 
-### Real attacher
+Cheat sheet:
 
-"Real" attacher talks to CSI over socket (`/run/csi/socket` by default, configurable by `-csi-address`). The attacher tries to connect for `-connection-timeout` (1 minute by default), allowing CSI driver to start and create its server socket a bit later.
-
-The attacher then:
-
-* Discovers the supported attacher name by `GetPluginInfo` calls. The attacher only processes `VolumeAttachment` instances that have `Attacher==GetPluginInfoResponse.Name`.
-* Uses `ControllerGetCapabilities` to find out if CSI driver supports `ControllerPublish` calls. It degrades to trivial mode if not.
-* Processes new/updated `VolumeAttachment` instances and attaches/detaches volumes:
-  * `VolumeAttachment` without `DeletionTimestamp`:
-    * Ignore `VolumeAttachment` that wants to attach PV with `DeletionTimestamp`.
-    * A finalizer is added to `VolumeAttachment` instance to preserve the object after deletion so we can detach the volume.
-    * A finalizer is added to referenced PV instance to preserve the PV. Attacher needs information from the PV to detach the volume.
-    * CSI `ControllerPublishVolume` is called.
-    * `AttachmentMetadata` is saved to `VolumeAttachment`.
-    * On any error, the `VolumeAttachment` is re-queued with exponential backoff.
-  * `VolumeAttachment` with `DeletionTimestamp`:
-    * CSI `ControllerUnpublishVolume` is called.
-    * A finalizer is removed from `VolumeAttachment`. At this point, the API server is going to delete this instance and "deleted `VolumeAttachment`" event will be received.
-
-* Processes deleted `VolumeAttachment` instances:
-  * Pokes PV queue with name of the detached PV. This triggers removal of finalizer on PV, if needed.
-
-* Processes added/updated PV to remove finalizer on PVs:
-  * Ignore PVs that don't have DeletionTimestamp.
-  * Checks that the PV is not used by any `VolumeAttachment` instance.
-  * Removes Attacher's finalizer on the PV if so.
-  * On any error, the PV is re-queued with exponential backoff.
-
-#### Concurrency
-
-Both PV queue and `VolumeAttachment` queue run in parallel. To ensure that removal of PV finalizers work without races:
-
-* The controller attaches PVs only when the PV has no DeletionTimestamp and has attacher's finalizer.
-* The controller removes finalizer only from PVs that have DeletionTimestamp.
-
-As consequence, the attacher must be available until all PVs that refer to the CSI driver *are removed*. Even fully detached PVs have attacher's finalizer that is removed only after the PV is marked for deletion.
-
-#### Alternatives considered
-
-Secondary cache and locks was considered to keep a map PV -> list of VolumeAttachments that use the PV. Attacher's finalizer could be removed from a PV immediately after the last VolumeAttachment was deleted. Keeping this map is either racy or requires long critical sections with complicated error recovery.
-
-## Usage
-
-### Dummy mode
-
-Dummy attacher watches for `VolumeAttachment` instances with `Attacher=="csi/dummy"` and marks them attached. It does not use any finalizers and is useful for testing.
-
-To run dummy attacher in `hack/local-up-cluster.sh` environment:
-
-```sh
-csi-attacher -dummy -kubeconfig ~/.kube/config -v 5
-```
-
-### Real attacher
-
-#### Running on command line
-
-For debugging, it's possible to run the attacher on command line:
-
-```sh
-csi-attacher -kubeconfig ~/.kube/config -v 5 -csi-address /run/csi/socket
-```
-
-#### Running in a deployment
-
-It is necessary to create a new service account and give it enough privileges to run the attacher. We provide one omnipotent yaml file that creates everything that's necessary, however it should be split into multiple files in production.
-
-```sh
-kubectl create deploy/kubernetes/deployment.yaml
-```
-
-Note that the attacher does not scale with more replicas. Only one attacher is elected as leader and running. The others are waiting for the leader to die. They re-elect a new active leader in ~15 seconds after death of the old leader.
-
-## Vendoring
-
-We use [dep](https://github.com/golang/dep) for management of `vendor/`.
-
-`vendor/k8s.io` is manually copied from `staging/` directory of work-in-progress API for CSI, namely <https://github.com/kubernetes/kubernetes/pull/54463>.
-
-## Community, discussion, contribution, and support
-
-Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
-
-You can reach the maintainers of this project at:
-
-* Slack channels
-  * [#wg-csi](https://kubernetes.slack.com/messages/wg-csi)
-  * [#sig-storage](https://kubernetes.slack.com/messages/sig-storage)
-* [Mailing list](https://groups.google.com/forum/#!forum/kubernetes-sig-storage)
-
-### Code of conduct
-
-Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
+- `git subtree add --prefix=release-tools https://github.com/kubernetes-csi/csi-release-tools.git master` - add release tools to a repo which does not have them yet (only once)
+- `git subtree pull --prefix=release-tools https://github.com/kubernetes-csi/csi-release-tools.git master` - update local copy to latest upstream (whenever upstream changes)
+- edit, `git commit`, `git subtree push --prefix=release-tools git@github.com:<user>/csi-release-tools.git <my-new-or-existing-branch>` - push to a new branch before submitting a PR
